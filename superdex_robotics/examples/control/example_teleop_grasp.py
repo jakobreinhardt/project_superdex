@@ -54,6 +54,10 @@ Keys (live mode; keep this terminal focused, not the debugger window):
      R        put the cup back
      ESC      quit
 
+Each press moves the hand MOVE_STEP; hold a key to glide. A readout of the hand
+target, grip and cup height prints while you steer, so you can tell a key that
+did nothing from a key that never arrived.
+
 Usage:
     cd <path_to_superdex_robotics>
     python3 examples/control/example_teleop_grasp.py
@@ -167,7 +171,24 @@ CALIBRATION_FLANGE_HEIGHT = 0.45  # [m]
 CALIBRATION_SECONDS = 2.5
 
 TIME_STEP = 1.0 / 200.0  # [s]
-MOVE_RATE = 0.18  # teleop translation speed [m/s]
+
+# How far the hand target jumps per key press [m].
+#
+# This used to be a speed (0.18 m/s) scaled by a bare 0.05, which worked out at
+# 9 mm per press. That is invisible at scene scale, and since live mode printed
+# nothing, a working teleop was indistinguishable from a dead one -- tapping a
+# key really did appear to do nothing at all. A press is a discrete event here
+# (msvcrt hands over characters, not key-down/key-up), so a distance per press
+# is the honest unit; holding a key lets auto-repeat turn it into a glide of
+# roughly 0.9 m/s.
+MOVE_STEP = 0.08
+
+# How far ahead of the arm the target is allowed to get [m]. Auto-repeat can
+# push the target far faster than OSC can follow it, and the arm then keeps
+# chasing long after the key is released, which feels like the controls are
+# lagging rather than the target having run off. A short leash keeps the motion
+# answering the keys instead of their history.
+TARGET_LEASH = 0.20
 
 # How fast the scripted hand target is allowed to travel [m/s]. The stages are
 # waypoints, so without this the target teleports between them and OSC yanks the
@@ -574,6 +595,7 @@ def main():
 
     stage = 0
     stage_started = scene.get_total_simulation_time()
+    next_report = 0.0
     lifted_peak = 0.0
     # Height at the end of the carry, before the deliberate release. Peak height
     # alone would pass a grasp that lifts the cup and then drops it mid-carry.
@@ -632,7 +654,13 @@ def main():
                         )
                     elif key in KEY_TO_AXIS:
                         axis, sign = KEY_TO_AXIS[key]
-                        hand_target[axis] += sign * MOVE_RATE * 0.05
+                        hand_target[axis] += sign * MOVE_STEP
+
+                flange = link_positions(actor, link_names)[ARM_EE_LINK]
+                lead = hand_target - flange
+                distance = float(np.linalg.norm(lead))
+                if distance > TARGET_LEASH:
+                    hand_target = flange + lead * (TARGET_LEASH / distance)
 
             # Ramp the grip toward its goal so the fingers close smoothly.
             grip += float(
@@ -649,6 +677,17 @@ def main():
                 set_grip_firmness(jsc, jsc_params, num_dofs, firmness)
 
             drive(hand_target, grip)
+
+            # A live readout, so a key that did nothing is distinguishable from
+            # a key that never arrived. Live mode printed nothing at all before,
+            # which is half of why small movements read as broken input.
+            if not args.auto and t >= next_report:
+                next_report = t + 0.25
+                sys.stdout.write(
+                    f"\r  hand {np.round(hand_target, 3)}  grip {grip:4.2f}  "
+                    f"cup_z {object_centre()[2]:.3f}   "
+                )
+                sys.stdout.flush()
     finally:
         if teleop is not None:
             teleop.close()
